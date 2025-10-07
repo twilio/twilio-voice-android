@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Redirecting...</title>
+  <script>
+    let destination = 'https://sdk.twilio.com/android/voice/latest/docs/'
+    // Extract the path and build the new URL
+    const host = window.location.hostname.toLowerCase();
+    const path = window.location.pathname;
+    const query = window.location.search || '';
+    if (host == 'twilio.github.io' && path.startsWith('/twilio-voice-android/docs')) {
+	const parts = path.split('/').filter(Boolean);
+	const version = parts[2];
+        const rest = parts.slice(3).join('/');
+        if (version && version.toLowerCase() == 'latest') {
+	    destination = 'https://sdk.twilio.com/android/voice/latest/docs/' +
+		(rest ? rest : '');
+        } else if (version) {
+            destination = 'https://sdk.twilio.com/android/voice/releases/' +
+		encodeURIComponent(version) + '/docs/' + (rest ? rest : '');
+        }       
+	if (destination) {
+            window.location.replace(destination + query)
+        }
+    }
+  </script>
+</head>
+<body>
+  <p>If you're not redirected, <a id="redir-link" href="#">click here</a>.</p>
+  <script>
+    document.getElementById('redir-link').href = destination + query;
+  </script>
+</body>
+</html>
