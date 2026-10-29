@@ -1,0 +1,86 @@
+# Publish a Voice Android release to Maven Central (VBLOCKS-7437).
+#
+# Run it after the Buildkite release build has promoted the QE-validated RC into JFrog
+# `releases`:
+#   gh workflow run maven-central.yml -R twilio/twilio-voice-android -f version=X.Y.Z
+#   gh workflow run maven-central.yml -R twilio/twilio-voice-android -f version=X.Y.Z -f dry_run=true
+# then follow it with `gh run watch`. It can also be started from the Actions tab.
+#
+# One job, approved once in the maven-central environment: `upload` (download from
+# `releases`, checksums, signatures, bundle, upload, wait for VALIDATED), then `publish`
+# with the deployment id `upload` returned (publish, wait for repo1.maven.org, verify every
+# file byte for byte against `releases`). A dry run stops after the bundle; it uses the
+# same environment, because it needs the JFrog token. See .github/maven-central/maven_central.py.
+#
+# This repo is public, so any signed-in GitHub user can read this workflow's log. Secrets
+# are masked, and the script logs only what is public once the release is out: never
+# print a secret, an internal URL or the internal repo's commit from a step here.
+name: Maven Central
+
+run-name: "Maven Central: ${{ inputs.version }}${{ inputs.dry_run && ' (dry run)' || '' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, X.Y.Z, already promoted into JFrog releases"
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run: download, check and bundle only; upload nothing"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Two runs for one version must not race; a second one waits for the first.
+concurrency:
+  group: maven-central-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # The twilio org's GitHub-hosted runners (group github-hosted-large); a job asking for
+    # standard ubuntu-latest stays queued.
+    runs-on: ubuntu-x64
+    environment: maven-central
+    # Upload and validation (up to 30 minutes), publishing (up to 90), then repo1.maven.org (up to 60).
+    timeout-minutes: 240
+    env:
+      VERSION: ${{ inputs.version }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Check the version
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must be X.Y.Z, a release (not an RC): got '$VERSION'"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Upload (step 1 of 2)
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_ARTIFACTORY_ACCESS_TOKEN: ${{ secrets.MAVEN_ARTIFACTORY_ACCESS_TOKEN }}
+        run: |
+          if [[ "$DRY_RUN" == "true" ]]; then
+            python3 .github/maven-central/maven_central.py upload "$VERSION" --dry-run
+          else
+            python3 .github/maven-central/maven_central.py upload "$VERSION"
+          fi
+
+      - name: Publish and verify (step 2 of 2)
+        if: inputs.dry_run == false
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_ARTIFACTORY_ACCESS_TOKEN: ${{ secrets.MAVEN_ARTIFACTORY_ACCESS_TOKEN }}
+        run: |
+          deployment="$(cat "build/maven-central/$VERSION/deployment-id")"
+          python3 .github/maven-central/maven_central.py publish "$deployment"
