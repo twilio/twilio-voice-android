@@ -42,7 +42,9 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    # The twilio org's GitHub-hosted runners (group github-hosted-large); a job asking for
+    # standard ubuntu-latest stays queued.
+    runs-on: ubuntu-x64
     environment: maven-central
     # Upload and validation (up to 30 minutes), publishing (up to 90), then repo1.maven.org (up to 60).
     timeout-minutes: 240
