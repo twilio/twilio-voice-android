@@ -6,27 +6,29 @@ the files the Buildkite release build promoted from the QE-validated RC, with th
 signatures, downloaded and re-uploaded unchanged (VBLOCKS-7400). Nothing is built or
 signed here.
 
-Publishing is two steps, run one after the other. Neither prompts, so they behave the
-same in a terminal, a script or an agent:
-    python3 local-build-publish/maven_central.py upload 6.10.5 --dry-run   # bundle only
-    python3 local-build-publish/maven_central.py upload 6.10.5             # step 1 of 2
-    python3 local-build-publish/maven_central.py publish <deployment-id>   # step 2 of 2
-    python3 local-build-publish/maven_central.py verify 6.10.5
+A release is published by the Maven Central workflow (.github/workflows/maven-central.yml,
+VBLOCKS-7437), which runs `upload` and then `publish` in one approved job. The commands
+can also be run by hand. Neither prompts, so they behave the same in a terminal, a script,
+an agent or the workflow:
+    python3 .github/maven-central/maven_central.py upload 6.10.5 --dry-run   # bundle only
+    python3 .github/maven-central/maven_central.py upload 6.10.5             # step 1 of 2
+    python3 .github/maven-central/maven_central.py publish <deployment-id>   # step 2 of 2
+    python3 .github/maven-central/maven_central.py verify 6.10.5
 and, for a deployment:
-    python3 local-build-publish/maven_central.py status  <deployment-id>
-    python3 local-build-publish/maven_central.py drop    <deployment-id>
+    python3 .github/maven-central/maven_central.py status  <deployment-id>
+    python3 .github/maven-central/maven_central.py drop    <deployment-id>
 
 `upload` (step 1 of 2) publishes nothing:
   1. Checks the Central credentials, and that X.Y.Z is not on Maven Central already.
+     --dry-run only reports a version that is: it can rehearse on a published release.
   2. Checks Artifactory releases holds exactly the 12 files of a promoted release.
   3. Downloads each file with the .md5, .sha1 and .sha256 Artifactory stores for it,
      and checks the bytes against all three. Using Artifactory's checksums rather than
      computing them here means a download that went wrong cannot slip through.
-  4. Verifies the 6 signatures against the release public key committed in
-     gradle/release-signing-key.asc, pinned by its fingerprint, with the Gradle task the
-     Buildkite promotion uses (verifyPromotedSignatures). The checksums only prove the
-     download is intact; this proves the files are the ones signed with the release key.
-     It needs no secret and no gpg.
+  4. Verifies the 6 signatures with gpg against the release public key committed next to
+     this script, release-signing-key.asc, pinned by its full fingerprint. The checksums
+     only prove the download is intact; this proves the files are the ones signed with the
+     release key. It needs no secret, and fetches nothing from a keyserver.
   5. Zips them in Maven repository layout: build/maven-central/X.Y.Z/bundle.zip.
      --dry-run stops here.
   6. Uploads the bundle as a USER_MANAGED deployment, waits for Central to validate
@@ -47,12 +49,25 @@ removed on Maven Central once it is out.
      then runs `verify`. If that wait or check doesn't finish, the release is still
      published: run `verify` later.
 
-Credentials come from the project-root .env used by the other scripts here, or from
-the environment:
+The log is public: this repo is public, so any signed-in GitHub user can read the
+workflow's log. It shows only what is public once the release is out. The RC a release was
+promoted from and the internal repo's commit are checked but not logged, and the Central
+deployment id is masked; look it up at https://central.sonatype.com/publishing/deployments.
+Keep it that way when adding a log line.
+
+Credentials come from the environment. In the workflow they are secrets of the
+maven-central environment:
   MAVEN_CENTRAL_USERNAME / MAVEN_CENTRAL_PASSWORD   a Central Portal *user token*
       (central.sonatype.com > account > Generate User Token), not your Portal login
-  MAVEN_ARTIFACTORY_USERNAME / MAVEN_ARTIFACTORY_ACCESS_TOKEN   read access to releases
-      (falls back to artifactory.username / artifactory.password in local.properties)
+  MAVEN_ARTIFACTORY_ACCESS_TOKEN   read access to releases, sent as a Bearer token; with
+      MAVEN_ARTIFACTORY_USERNAME also set, it is sent as Basic username:token instead
+
+The release key: release-signing-key.asc is the keyserver's copy, byte for byte, and the
+same file as gradle/release-signing-key.asc in twilio-internal/twilio-voice-android, which
+the Buildkite promotion verifies against:
+  curl -s 'https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x<fingerprint>'
+Extending its expiry means a reviewed change to the file in both repos; rotating the key
+means that and a change to RELEASE_KEY_FINGERPRINT here and in gradle/promote-release.gradle.
 """
 
 from __future__ import annotations
@@ -65,6 +80,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -74,7 +90,10 @@ import zipfile
 from http.client import HTTPException
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
+RELEASE_KEY = SCRIPT_DIR / "release-signing-key.asc"
+RELEASE_KEY_FINGERPRINT = "FBEE934DEA17EF92318148144E0DA7D1F7DA745D"
 ARTIFACTORY = "https://twilio.jfrog.io/artifactory"
 CENTRAL_API = "https://central.sonatype.com/api/v1/publisher"
 MAVEN_CENTRAL = "https://repo1.maven.org/maven2"
@@ -99,22 +118,18 @@ def log(message: str) -> None:
     print(f"maven-central: {message}", flush=True)
 
 
+def mask(value: str) -> None:
+    """Hide a value in the workflow's log: this repo is public, so any GitHub user can
+    read it. The log shows only what is public once the release is out."""
+    if os.environ.get("GITHUB_ACTIONS") == "true" and value:
+        print(f"::add-mask::{value}", flush=True)
+
+
 # --- credentials -----------------------------------------------------------------------
 
 
-def read_key_values(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
-    if path.exists():
-        for raw in path.read_text().splitlines():
-            line = raw.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, value = line.split("=", 1)
-                values[key.strip()] = value.strip().strip('"').strip("'")
-    return values
-
-
-def credential(dotenv: dict[str, str], name: str) -> str:
-    return os.environ.get(name) or dotenv.get(name, "")
+def credential(name: str) -> str:
+    return os.environ.get(name, "").strip()
 
 
 def basic(user: str, password: str) -> str:
@@ -139,12 +154,14 @@ def http(method: str, url: str, auth: str | None = None, data: bytes | None = No
     except urllib.error.HTTPError as error:
         return error.code, error.read()
     except (urllib.error.URLError, HTTPException, OSError) as error:
-        # A dropped or refused TLS connection here has been Zscaler, not the server:
-        # retrying didn't help, re-authenticating Zscaler did (6.10.5, 2026-10-19).
+        # On a laptop, a dropped or refused TLS connection here has been Zscaler, not the
+        # server: retrying didn't help, re-authenticating Zscaler did (6.10.5, 2026-10-19).
         reason = getattr(error, "reason", error)
         host = urllib.parse.urlsplit(url).hostname
-        raise NetworkFailure(f"network error talking to {host} ({reason}). Check Zscaler and "
-                             "authenticate, then run the command again.") from None
+        where = ("the runner cannot reach it" if os.environ.get("GITHUB_ACTIONS") == "true"
+                 else "check Zscaler and authenticate")
+        raise NetworkFailure(f"network error talking to {host} ({reason}): {where}, then run "
+                             "the command again.") from None
 
 
 def expected_names(version: str) -> list[str]:
@@ -159,11 +176,11 @@ def folder(version: str) -> str:
 
 
 class Artifactory:
-    def __init__(self, user: str, password: str, repo: str) -> None:
-        if not user or not password:
-            raise Failure("no Artifactory credentials: set MAVEN_ARTIFACTORY_USERNAME and "
-                          "MAVEN_ARTIFACTORY_ACCESS_TOKEN in .env")
-        self.auth = "Basic " + basic(user, password)
+    def __init__(self, user: str, token: str, repo: str) -> None:
+        if not token:
+            raise Failure("no Artifactory credentials: set MAVEN_ARTIFACTORY_ACCESS_TOKEN "
+                          "(and MAVEN_ARTIFACTORY_USERNAME for Basic auth)")
+        self.auth = "Basic " + basic(user, token) if user else "Bearer " + token
         self.repo = repo
 
     def get(self, path: str) -> tuple[int, bytes]:
@@ -182,7 +199,7 @@ class Central:
     def __init__(self, user: str, password: str) -> None:
         if not user or not password:
             raise Failure("no Central credentials: set MAVEN_CENTRAL_USERNAME and "
-                          "MAVEN_CENTRAL_PASSWORD (a Portal user token) in .env")
+                          "MAVEN_CENTRAL_PASSWORD (a Portal user token)")
         self.auth = "Bearer " + basic(user, password)
 
     def call(self, method: str, path: str, **kwargs) -> tuple[int, bytes]:
@@ -289,22 +306,14 @@ def wait_for(central: Central, deployment: str, wanted: str, timeout_minutes: in
 # --- commands ----------------------------------------------------------------------------
 
 
-def credentials() -> tuple[dict[str, str], dict[str, str]]:
-    return read_key_values(PROJECT_ROOT / ".env"), read_key_values(PROJECT_ROOT / "local.properties")
-
-
 def artifactory_for(repo: str) -> Artifactory:
-    dotenv, local = credentials()
-    return Artifactory(
-        credential(dotenv, "MAVEN_ARTIFACTORY_USERNAME") or local.get("artifactory.username", ""),
-        credential(dotenv, "MAVEN_ARTIFACTORY_ACCESS_TOKEN") or local.get("artifactory.password", ""),
-        repo)
+    return Artifactory(credential("MAVEN_ARTIFACTORY_USERNAME"),
+                       credential("MAVEN_ARTIFACTORY_ACCESS_TOKEN"), repo)
 
 
 def central_client(required: bool = True) -> Central | None:
-    dotenv, _ = credentials()
-    user = credential(dotenv, "MAVEN_CENTRAL_USERNAME")
-    password = credential(dotenv, "MAVEN_CENTRAL_PASSWORD")
+    user = credential("MAVEN_CENTRAL_USERNAME")
+    password = credential("MAVEN_CENTRAL_PASSWORD")
     if not required and not (user and password):
         return None
     return Central(user, password)
@@ -321,7 +330,7 @@ def fetch_release(artifactory: Artifactory, version: str, work: Path) -> Path:
         raise Failure(f"{artifactory.repo}/{folder(version)} is not the expected 12 files; "
                       f"missing {sorted(set(expected) - set(names)) or 'none'}, "
                       f"unexpected {sorted(set(names) - set(expected)) or 'none'}")
-    log(f"{artifactory.repo}/{folder(version)}: the 12 expected files")
+    log(f"Artifactory {artifactory.repo}: the 12 expected files")
 
     aar = f"{folder(version)}/{ARTIFACT}-{version}.aar"
     properties = artifactory.storage(f"{aar}?properties").get("properties", {})
@@ -329,7 +338,8 @@ def fetch_release(artifactory: Artifactory, version: str, work: Path) -> Path:
         if not properties.get("promoted.from") or not properties.get("git.commit"):
             raise Failure(f"{aar} has no promoted.from / git.commit property: it was not "
                           "published by the Buildkite release build, so it is not uploaded")
-        log(f"promoted from {properties['promoted.from'][0]}, git.commit {properties['git.commit'][0]}")
+        # Checked, not logged: the RC and the internal repo's commit are not public.
+        log("published by the Buildkite release build (promoted.from and git.commit are set)")
 
     files = work / "files"
     files.mkdir(parents=True)
@@ -355,17 +365,47 @@ def fetch_release(artifactory: Artifactory, version: str, work: Path) -> Path:
     return files
 
 
-def verify_signatures(files: Path) -> None:
+def gpg(home: str, *args: str) -> subprocess.CompletedProcess:
+    """gpg on a keyring of its own, which holds the release key and nothing else."""
+    try:
+        return subprocess.run(["gpg", "--homedir", home, "--batch", "--no-tty",
+                               "--no-auto-key-retrieve", *args], capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Failure("gpg is not installed; it verifies the signatures") from None
+
+
+def verify_signatures(files: Path, version: str) -> None:
     """Step 4: every signature verifies against the pinned release key."""
-    # --console=plain: the progress bar's redraws can overwrite a "good signature" line.
-    result = subprocess.run(
-        [str(PROJECT_ROOT / "gradlew"), "-q", "--console=plain", f"-Ppromote.dir={files}",
-         "verifyPromotedSignatures"],
-        cwd=PROJECT_ROOT)
-    if result.returncode != 0:
-        raise Failure("signature verification failed (see Gradle output above); "
-                      "these are not the files signed with the release key")
-    log("all 6 signatures verify against the pinned release key")
+    with tempfile.TemporaryDirectory(prefix="gnupg-") as home:
+        # The file must hold the release key and no other key: gpg trusts every key on the
+        # keyring, so a second one added to the file would be trusted too.
+        shown = gpg(home, "--with-colons", "--with-fingerprint", "--show-keys", str(RELEASE_KEY))
+        records = [line.split(":") for line in shown.stdout.splitlines()]
+        primaries = [record[9] for previous, record in zip(records, records[1:])
+                     if previous[0] == "pub" and record[0] == "fpr"]
+        if shown.returncode != 0 or primaries != [RELEASE_KEY_FINGERPRINT]:
+            raise Failure(f"{RELEASE_KEY.name} must hold the release key "
+                          f"{RELEASE_KEY_FINGERPRINT} and no other; it holds "
+                          f"{primaries or 'no readable key'}\n{shown.stderr.strip()}")
+        imported = gpg(home, "--import", str(RELEASE_KEY))
+        if imported.returncode != 0:
+            raise Failure(f"gpg could not import {RELEASE_KEY.name}:\n{imported.stderr.strip()}")
+
+        for name in (n for n in expected_names(version) if not n.endswith(".asc")):
+            result = gpg(home, "--status-fd", "1", "--verify",
+                         str(files / f"{name}.asc"), str(files / name))
+            valid = [line.split()[2:] for line in result.stdout.splitlines()
+                     if line.startswith("[GNUPG:] VALIDSIG ")]
+            # VALIDSIG <signing key fingerprint> ... <primary key fingerprint>. One signature,
+            # made by the release key itself: not a subkey, as the Gradle check requires.
+            if (result.returncode != 0 or len(valid) != 1
+                    or valid[0][0] != RELEASE_KEY_FINGERPRINT
+                    or valid[0][-1] != RELEASE_KEY_FINGERPRINT):
+                raise Failure(f"{name}.asc is not one good signature of {name} by the release "
+                              f"key {RELEASE_KEY_FINGERPRINT}; these are not the files signed "
+                              f"with the release key\n{result.stderr.strip()}")
+            log(f"{name}: good signature")
+    log(f"all 6 signatures verify against the pinned release key {RELEASE_KEY_FINGERPRINT}")
 
 
 def build_bundle(files: Path, version: str, work: Path) -> Path:
@@ -375,7 +415,7 @@ def build_bundle(files: Path, version: str, work: Path) -> Path:
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
         for name in entries:
             archive.write(files / name, f"{folder(version)}/{name}")
-    log(f"bundle: {bundle} ({len(entries)} entries, {bundle.stat().st_size:,} bytes)")
+    log(f"bundle: {len(entries)} entries, {bundle.stat().st_size:,} bytes")
     return bundle
 
 
@@ -385,16 +425,24 @@ def upload(args: argparse.Namespace) -> None:
         raise Failure("a real upload takes a release X.Y.Z from releases; --source-repo and "
                       "other versions are for --dry-run tests only")
 
-    # Step 1. A dry run without Central credentials still builds the bundle.
+    # Step 1. A dry run without Central credentials still builds the bundle, and a dry run
+    # of a published release still runs every check, which makes it a rehearsal.
+    def already(where: str) -> None:
+        message = f"{GROUP}:{ARTIFACT}:{version} is already {where}"
+        if not args.dry_run:
+            raise Failure(message)
+        log(f"{message}; carrying on, as this is a dry run")
+
     central = central_client(required=not args.dry_run)
     if central is None:
-        log("no Central credentials in .env: skipping the credential check (dry run)")
+        log("no Central credentials: skipping the credential check (dry run)")
     elif central.is_published(version):
-        raise Failure(f"{GROUP}:{ARTIFACT}:{version} is already published on Maven Central")
+        log("Central credentials accepted")
+        already("published on Maven Central")
     else:
         log(f"Central credentials accepted; {version} is not published yet")
     if on_maven_central(version):
-        raise Failure(f"{GROUP}:{ARTIFACT}:{version} is already on repo1.maven.org")
+        already("on repo1.maven.org")
 
     work = PROJECT_ROOT / "build" / "maven-central" / version
     if work.exists():
@@ -403,7 +451,7 @@ def upload(args: argparse.Namespace) -> None:
     work.mkdir(parents=True, exist_ok=True)
 
     files = fetch_release(artifactory_for(args.source_repo), version, work)
-    verify_signatures(files)
+    verify_signatures(files, version)
     bundle = build_bundle(files, version, work)
 
     if args.dry_run:
@@ -415,8 +463,9 @@ def upload(args: argparse.Namespace) -> None:
 
     # Step 6.
     deployment = central.upload(bundle, f"{GROUP}:{ARTIFACT}:{version}")
+    mask(deployment)
     (work / "deployment-id").write_text(deployment + "\n")
-    log(f"uploaded; deployment id {deployment} (saved in {work / 'deployment-id'})")
+    log(f"uploaded; deployment id {deployment} (saved in build/maven-central/{version}/deployment-id)")
     try:
         info = wait_for(central, deployment, "VALIDATED", timeout_minutes=30)
     except NetworkFailure as failure:
@@ -435,12 +484,14 @@ def upload(args: argparse.Namespace) -> None:
 
 
 def status(args: argparse.Namespace) -> None:
+    mask(args.deployment)
     print(json.dumps(central_client().status(args.deployment), indent=2))
 
 
 def publish(args: argparse.Namespace) -> None:
     """Step 2 of 2: publish a deployment `upload` left VALIDATED."""
     central, deployment = central_client(), args.deployment
+    mask(deployment)
     info = central.status(deployment)
     state, name = info.get("deploymentState"), info.get("deploymentName", "")
     if state != "VALIDATED":
@@ -471,6 +522,7 @@ def publish(args: argparse.Namespace) -> None:
 
 
 def drop(args: argparse.Namespace) -> None:
+    mask(args.deployment)
     central_client().drop(args.deployment)
     log(f"dropped deployment {args.deployment}")
 
